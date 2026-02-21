@@ -1,4 +1,5 @@
 import aiosqlite
+import logging  # ✅ Добавьте!
 import os
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -231,6 +232,28 @@ async def init_db():
                          ) REFERENCES orders
                          (
                              id
+                         )
+                             )
+                         """)
+
+        await db.execute("""
+                         CREATE TABLE IF NOT EXISTS user_settings
+                         (
+                             user_id
+                             INTEGER
+                             PRIMARY
+                             KEY,
+                             use_bonus
+                             INTEGER
+                             DEFAULT
+                             1,
+                             FOREIGN
+                             KEY
+                         (
+                             user_id
+                         ) REFERENCES users
+                         (
+                             user_id
                          )
                              )
                          """)
@@ -575,11 +598,41 @@ async def create_order(user_id: int, cart_items: List[Dict],
             total_price = sum(item['price'] * item['quantity'] for item in cart_items)
             final_price = total_price - (total_price * discount_percent // 100)
 
-            # Генерация номера заказа
-            cursor = await db.execute("SELECT COUNT(*) FROM orders")
-            result = await cursor.fetchone()  # ✅ Добавлен await!
-            order_count = result[0] + 1
-            order_number = f"ORDER-{order_count:06d}"
+            # Генерация УНИКАЛЬНОГО номера заказа
+            order_number = None
+            max_attempts = 100  # Максимум попыток генерации
+
+            for attempt in range(max_attempts):
+                # Получаем текущее количество заказов
+                cursor = await db.execute("SELECT COUNT(*) FROM orders")
+                result = await cursor.fetchone()
+                order_count = result[0] + 1
+
+                # Генерируем номер заказа с timestamp для уникальности
+                import time
+                timestamp = int(time.time() * 1000) % 1000000  # Последние 6 цифр timestamp
+                order_number = f"ORDER-{timestamp:06d}"
+
+                # Проверяем, существует ли уже такой номер
+                cursor = await db.execute(
+                    "SELECT id FROM orders WHERE order_number = ?",
+                    (order_number,)
+                )
+                exists = await cursor.fetchone()
+
+                if not exists:
+                    # Номер уникален, выходим из цикла
+                    break
+
+                # Если номер занят, ждем немного и пробуем снова
+                import asyncio
+                await asyncio.sleep(0.01)
+
+            if not order_number:
+                logging.error("❌ Не удалось сгенерировать уникальный номер заказа")
+                return None
+
+            logging.info(f"📋 Создаем заказ {order_number} для пользователя {user_id}")
 
             # Создание заказа
             await db.execute("""
@@ -588,10 +641,12 @@ async def create_order(user_id: int, cart_items: List[Dict],
                              VALUES (?, ?, ?, ?, ?, 'pending')
                              """, (order_number, user_id, total_price, discount_percent, final_price))
 
-            # ✅ Получаем ID созданного заказа
+            # Получаем ID созданного заказа
             cursor = await db.execute("SELECT last_insert_rowid()")
-            result = await cursor.fetchone()  # ✅ Добавлен await!
+            result = await cursor.fetchone()
             order_id = result[0]
+
+            logging.info(f"✅ Заказ создан с ID={order_id}, номер={order_number}")
 
             # Добавление позиций заказа
             for item in cart_items:
@@ -611,10 +666,11 @@ async def create_order(user_id: int, cart_items: List[Dict],
                                  """, (item['quantity'], item['product_id']))
 
             await db.commit()
+            logging.info(f"✅ Заказ {order_number} успешно создан!")
             return order_number
 
     except Exception as e:
-        print(f"❌ Error creating order: {e}")
+        logging.error(f"❌ Error creating order: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -726,3 +782,34 @@ async def delete_order(order_number: str) -> bool:
         import traceback
         traceback.print_exc()
         return False
+
+
+async def create_welcome_bonus(user_id: int, discount_percent: int = 10):
+    """Создание приветственной скидки для нового пользователя"""
+    # Проверяем, есть ли уже активные бонусы
+    existing_bonus = await get_active_bonus(user_id)
+    if existing_bonus:
+        return False  # Бонус уже есть
+
+    # Добавляем новый бонус
+    await add_bonus(user_id, discount_percent)
+    return True
+
+async def set_bonus_usage(user_id: int, use_bonus: bool):
+    """Установка флага использования бонуса для текущего заказа"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO user_settings (user_id, use_bonus) 
+            VALUES (?, ?)
+        """, (user_id, 1 if use_bonus else 0))
+        await db.commit()
+
+
+async def get_bonus_usage(user_id: int) -> bool:
+    """Получение флага использования бонуса"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT use_bonus FROM user_settings WHERE user_id = ?
+        """, (user_id,))
+        result = await cursor.fetchone()
+        return result[0] == 1 if result else True  # По умолчанию True

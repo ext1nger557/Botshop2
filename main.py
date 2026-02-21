@@ -1,7 +1,8 @@
 import os
 import logging
+import aiosqlite  # ✅ ВАЖНО!
 from datetime import datetime
-from typing import List, Dict, Optional  # ✅ Добавьте эту строку!
+from typing import List, Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -19,6 +20,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 import database as db
+from database import DB_PATH
 import keyboards as kb
 #Загрузка токена из .env и проверка
 
@@ -64,40 +66,48 @@ class AdminStates(StatesGroup):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    logging.info(f"📩 Получена команда /start от пользователя {message.from_user.id}")
+    """Обработчик /start"""
+    if await check_banned(message):
+        return
 
-    try:
-        if await check_banned(message):
-            logging.warning(f"Пользователь {message.from_user.id} в бане")
-            return
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
 
-        user_id = message.from_user.id
-        username = message.from_user.username
-        first_name = message.from_user.first_name
+    # ✅ ПРОВЕРКА: новый ли пользователь (используем db.DB_PATH)
+    async with aiosqlite.connect(db.DB_PATH) as conn:  # ✅ Изменили 'db' на 'conn'
+        cursor = await conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        existing_user = await cursor.fetchone()
 
-        logging.info(f"Создаем/обновляем пользователя: {user_id}")
-        await db.get_or_create_user(user_id, username, first_name)
-        is_admin = await db.is_admin(user_id) or (user_id == ADMIN_ID)
+    # ✅ Вызываем функцию из модуля database (не из подключения!)
+    await db.get_or_create_user(user_id, username, first_name)
+    is_admin = await db.is_admin(user_id) or (user_id == ADMIN_ID)
 
-        welcome_text = (
-            f"👋 Привет, {first_name}!\n\n"
-            f"🛍️ Добро пожаловать в наш Telegram-магазин!\n\n"
-            f"🔥 <b>Подпишитесь на наш канал:</b>\n"
-            f"👉 {CHANNEL_LINK}\n\n"
-            f"Здесь вы найдете эксклюзивные товары по лучшим ценам! 🎁"
-        )
+    # Если новый пользователь - даем приветственную скидку
+    if not existing_user:
+        bonus_created = await db.create_welcome_bonus(user_id, 10)
+        if bonus_created:
+            await message.answer(
+                f"🎁 <b>Приветственный бонус!</b>\n\n"
+                f"Вам начислена скидка <b>10%</b> на первый заказ!\n"
+                f"Скидка применится автоматически при оформлении заказа.\n\n"
+                f"Проверить бонусы: кнопка 🎁 Бонусы",
+                parse_mode="HTML"
+            )
 
-        logging.info(f"Отправляем приветственное сообщение пользователю {user_id}")
-        await message.answer(
-            welcome_text,
-            reply_markup=kb.get_main_keyboard(user_id, is_admin),
-            parse_mode="HTML"
-        )
-        logging.info(f"✅ Сообщение отправлено пользователю {user_id}")
+    welcome_text = (
+        f"👋 Привет, {first_name}!\n\n"
+        f"🛍️ Добро пожаловать в наш Telegram-магазин!\n\n"
+        f"🔥 <b>Подпишитесь на наш канал:</b>\n"
+        f"👉 {CHANNEL_LINK}\n\n"
+        f"Здесь вы найдете эксклюзивные товары по лучшим ценам! 🎁"
+    )
 
-    except Exception as e:
-        logging.error(f"❌ Ошибка в /start: {e}", exc_info=True)
-        await message.answer("Произошла ошибка. Попробуйте позже.")
+    await message.answer(
+        welcome_text,
+        reply_markup=kb.get_main_keyboard(user_id, is_admin),
+        parse_mode="HTML"
+    )
 
 
 @dp.message(F.text == "🔙 Назад в меню")
@@ -324,7 +334,7 @@ async def cart_clear(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "order:checkout")
 async def order_checkout(callback: types.CallbackQuery):
-    """Оформление заказа - предпросмотр"""
+    """Оформление заказа - предпросмотр с выбором бонуса"""
     user_id = callback.from_user.id
     cart = await db.get_cart(user_id)
 
@@ -334,7 +344,9 @@ async def order_checkout(callback: types.CallbackQuery):
 
     total = sum(item['price'] * item['quantity'] for item in cart)
     bonus = await db.get_active_bonus(user_id)
+    use_bonus = await db.get_bonus_usage(user_id)
 
+    # Формируем текст
     text = "📋 <b>Ваш заказ:</b>\n\n"
     for item in cart:
         subtotal = item['price'] * item['quantity']
@@ -344,14 +356,51 @@ async def order_checkout(callback: types.CallbackQuery):
 
     if bonus:
         discount = total * bonus // 100
-        final = total - discount
-        text += f"\n🎁 Скидка {bonus}%: -{discount}₽"
-        text += f"\n✅ <b>К оплате: {final}₽</b>"
+        if use_bonus:
+            final = total - discount
+            text += f"\n🎁 Скидка {bonus}%: -{discount}₽"
+            text += f"\n✅ <b>К оплате: {final}₽</b>"
+        else:
+            text += f"\n🎁 Скидка {bonus}%: <i>не используется</i>"
+            text += f"\n✅ <b>К оплате: {total}₽</b>"
     else:
         text += f"\n✅ <b>К оплате: {total}₽</b>"
 
-    await callback.message.edit_text(text, reply_markup=kb.get_checkout_keyboard(), parse_mode="HTML")
+    # Показываем клавиатуру с выбором бонуса (если есть бонус)
+    if bonus:
+        keyboard = kb.get_bonus_choice_keyboard(use_bonus)
+    else:
+        keyboard = kb.get_checkout_keyboard()
+
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        # Если сообщение не изменилось, просто отвечаем
+        logging.debug(f"Message not modified: {e}")
+
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("bonus:toggle:"))
+async def bonus_toggle(callback: types.CallbackQuery):
+    """Переключение использования бонуса"""
+    user_id = callback.from_user.id
+    action = callback.data.split(":")[2]
+
+    use_bonus = (action == "yes")
+    await db.set_bonus_usage(user_id, use_bonus)
+
+    await callback.answer(
+        f"✅ Скидка {'будет использована' if use_bonus else 'не будет использована'}",
+        show_alert=False
+    )
+
+    # Перезапускаем checkout для обновления
+    await order_checkout(callback)
 
 
 @dp.callback_query(F.data == "order:pay")
@@ -364,37 +413,34 @@ async def order_pay(callback: types.CallbackQuery):
         await callback.answer("Корзина пуста!", show_alert=True)
         return
 
-    # Получаем активный бонус
+    # Получаем активный бонус и настройку использования
     bonus = await db.get_active_bonus(user_id)
+    use_bonus = await db.get_bonus_usage(user_id)
+
+    # Если пользователь выбрал не использовать скидку - обнуляем бонус
+    final_bonus = bonus if use_bonus else 0
 
     # Создаем заказ
-    order_number = await db.create_order(user_id, cart, bonus or 0)
+    order_number = await db.create_order(user_id, cart, final_bonus)
 
     if not order_number:
         await callback.answer("❌ Ошибка создания заказа", show_alert=True)
         return
 
-    # Деактивация бонуса после использования
-    if bonus:
+    # Деактивация бонуса после использования (только если использовали)
+    if use_bonus and bonus:
         await db.deactivate_bonus(user_id)
 
     # Очистка корзины
     await db.clear_cart(user_id)
 
-    # 🔔 ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ АДМИНАМ
-    total = sum(item['price'] * item['quantity'] for item in cart)
-    final = total - (total * (bonus or 0) // 100)
-
-    await notify_admins_about_order(
-        order_number=order_number,
-        user_id=user_id,
-        total=total,
-        final=final,
-        discount=bonus or 0,
-        cart=cart
-    )
+    # Сбрасываем настройку использования бонуса
+    await db.set_bonus_usage(user_id, True)
 
     # Формирование сообщения для пользователя
+    total = sum(item['price'] * item['quantity'] for item in cart)
+    final = total - (total * final_bonus // 100)
+
     payment_text = (
         f"✅ <b>Заказ #{order_number} создан!</b>\n\n"
         f"💳 <b>Оплата переводом:</b>\n"
@@ -1038,6 +1084,33 @@ async def admin_bonus_add_process(message: types.Message, state: FSMContext):
     await state.clear()
 
 
+@dp.callback_query(F.data.startswith("admin:bonus:remove:"))
+async def admin_bonus_remove(callback: types.CallbackQuery):
+    """Удаление всех активных скидок пользователя"""
+    target_user_id = int(callback.data.split(":")[3])
+
+    # Получаем все бонусы пользователя
+    bonuses = await db.get_user_bonuses(target_user_id)
+
+    if not bonuses:
+        await callback.answer("❌ У пользователя нет бонусов", show_alert=True)
+        return
+
+    # Удаляем все бонусы
+    removed_count = 0
+    for bonus in bonuses:
+        if bonus['is_active']:
+            await db.remove_bonus(bonus['id'])
+            removed_count += 1
+
+    await callback.answer(f"✅ Удалено {removed_count} скидок", show_alert=True)
+
+    # Обновляем клавиатуру
+    await callback.message.edit_reply_markup(
+        reply_markup=kb.get_bonus_actions_keyboard(target_user_id)
+    )
+
+
 @dp.message(F.text == "🚫 ЧС пользователей")
 async def admin_blacklist(message: types.Message):
     """Управление черным списком"""
@@ -1360,6 +1433,28 @@ async def admin_order_view(callback: types.CallbackQuery):
 
         orders = await db.get_all_orders()
         await callback.message.edit_reply_markup(reply_markup=kb.get_orders_keyboard(orders))
+
+@dp.message(F.text == "🔙 Назад")
+async def back_button_handler(message: types.Message, state: FSMContext):
+    """Обработчик кнопки Назад из разных меню"""
+    await state.clear()
+    is_admin = await db.is_admin(message.from_user.id) or (message.from_user.id == ADMIN_ID)
+    await message.answer(
+        "📋 Главное меню:",
+        reply_markup=kb.get_main_keyboard(message.from_user.id, is_admin)
+    )
+
+
+# Для админ-панели
+@dp.message(F.text == "🔙 В главное меню")
+async def admin_back_to_main(message: types.Message, state: FSMContext):
+    """Возврат из админ-панели в главное меню"""
+    await state.clear()
+    is_admin = await db.is_admin(message.from_user.id) or (message.from_user.id == ADMIN_ID)
+    await message.answer(
+        "📋 Главное меню:",
+        reply_markup=kb.get_main_keyboard(message.from_user.id, is_admin)
+    )
 
 # ==================== CATCH ALL CALLBACKS ====================
 @dp.callback_query(F.data == "menu:main")

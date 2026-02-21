@@ -326,3 +326,45 @@ def get_admin_order_keyboard(order_number: str) -> InlineKeyboardMarkup:
     )
     builder.row(InlineKeyboardButton(text="📋 Открыть заказ", callback_data=f"admin:order:{order_number}"))
     return builder.as_markup()
+
+def get_bonus_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Действия с бонусами пользователя"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="➕ Добавить скидку", callback_data=f"admin:bonus:add:{user_id}"),
+        InlineKeyboardButton(text="🗑️ Удалить скидку", callback_data=f"admin:bonus:remove:{user_id}")
+    )
+    # Убрали кнопку "Мои скидки"
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin:bonuses"))
+    return builder.as_markup()
+
+
+def get_bonus_choice_keyboard(use_bonus: bool) -> InlineKeyboardMarkup:
+    """Клавиатура выбора использования бонуса"""
+    builder = InlineKeyboardBuilder()
+
+    if use_bonus:
+        # Скидка ИСПОЛЬЗУЕТСЯ
+        builder.row(InlineKeyboardButton(
+            text="✅ Использовать скидку",
+            callback_data="bonus:toggle:no"  # Переключить на НЕТ
+        ))
+    else:
+        # Скидка НЕ используется
+        builder.row(InlineKeyboardButton(
+            text="❌ Использовать скидку",
+            callback_data="bonus:toggle:yes"  # Переключить на ДА
+        ))
+
+    # Кнопка оформления заказа (всегда доступна)
+    builder.row(InlineKeyboardButton(
+        text="✅ Оформить заказ",
+        callback_data="order:pay"
+    ))
+
+    builder.row(InlineKeyboardButton(
+        text="🔙 Вернуться в корзину",
+        callback_data="menu:cart"
+    ))
+
+    return builder.as_markup()
