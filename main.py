@@ -1,6 +1,8 @@
 import os
 import logging
 from datetime import datetime
+from typing import List, Dict, Optional  # ✅ Добавьте эту строку!
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -18,7 +20,6 @@ from dotenv import load_dotenv
 
 import database as db
 import keyboards as kb
-
 #Загрузка токена из .env и проверка
 
 load_dotenv()
@@ -149,7 +150,7 @@ async def back_to_catalog(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("product:"))
 async def show_product(callback: types.CallbackQuery):
-    """Показ деталей товара с кнопками +/-"""
+    """Показ деталей товара с учетом товаров в корзине"""
     product_id = int(callback.data.split(":")[1])
     product = await db.get_product(product_id)
 
@@ -157,24 +158,27 @@ async def show_product(callback: types.CallbackQuery):
         await callback.answer("❌ Товар не найден", show_alert=True)
         return
 
-    # Проверяем, есть ли товар в корзине
+    # Проверяем, есть ли товар в корзине пользователя
     cart = await db.get_cart(callback.from_user.id)
     cart_item = next((item for item in cart if item['product_id'] == product_id), None)
     in_cart = cart_item['quantity'] if cart_item else 0
+
+    # 🔄 Вычисляем доступный остаток (с учетом корзины)
+    available_stock = product['stock'] - in_cart
 
     text = (
         f"📦 <b>{product['name']}</b>\n\n"
         f"📝 {product['description'] or 'Описание отсутствует'}\n\n"
         f"💰 Цена: <b>{product['price']}₽</b>\n"
-        f"📦 В наличии: <b>{product['stock']} шт.</b>\n"
+        f"📦 В наличии: <b>{available_stock} шт.</b>\n"
     )
 
     if in_cart > 0:
-        text += f"\n🛒 <b>В корзине: {in_cart} шт.</b>"
+        text += f"🛒 <b>В вашей корзине: {in_cart} шт.</b>\n"
 
     await callback.message.edit_text(
         text,
-        reply_markup=kb.get_product_keyboard(product_id, product['stock'], in_cart),
+        reply_markup=kb.get_product_keyboard(product_id, available_stock, in_cart),
         parse_mode="HTML"
     )
     await callback.answer()
@@ -186,7 +190,6 @@ async def cart_add(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     product_id = int(parts[2])
 
-    # Получаем текущие данные о товаре
     product = await db.get_product(product_id)
     if not product:
         await callback.answer("❌ Товар не найден", show_alert=True)
@@ -194,17 +197,19 @@ async def cart_add(callback: types.CallbackQuery):
 
     user_id = callback.from_user.id
 
-    # Проверяем, есть ли уже в корзине
+    # Проверяем, сколько уже в корзине
     cart = await db.get_cart(user_id)
     cart_item = next((item for item in cart if item['product_id'] == product_id), None)
-    current_qty = cart_item['quantity'] if cart_item else 0
+    current_in_cart = cart_item['quantity'] if cart_item else 0
 
-    # Проверяем остаток на складе
-    if product['stock'] <= 0:
-        await callback.answer("⚠️ Товар закончился на складе!", show_alert=True)
+    # 🔄 Проверяем доступный остаток (с учетом уже добавленного)
+    available_stock = product['stock'] - current_in_cart
+
+    if available_stock <= 0:
+        await callback.answer("⚠️ Товар закончился!", show_alert=True)
         return
 
-    # Добавляем в корзину
+    # Добавляем в корзину (БЕЗ изменения остатка в БД)
     success = await db.add_to_cart(user_id, product_id, 1)
     if not success:
         await callback.answer("⚠️ Ошибка добавления в корзину", show_alert=True)
@@ -212,7 +217,7 @@ async def cart_add(callback: types.CallbackQuery):
 
     await callback.answer("✅ Товар добавлен!", show_alert=False)
 
-    # 🔄 ОБНОВЛЯЕМ сообщение с актуальным остатком
+    # 🔄 Обновляем сообщение (покажет новый доступный остаток)
     await update_product_message(callback, product_id)
 
 
@@ -244,13 +249,13 @@ async def cart_decrease(callback: types.CallbackQuery):
 
     await callback.answer("✅ Количество уменьшено", show_alert=False)
 
-    # 🔄 ОБНОВЛЯЕМ сообщение с актуальным остатком
+    # 🔄 Обновляем сообщение (покажет восстановленный остаток)
     await update_product_message(callback, product_id)
 
 
 async def update_product_message(callback: types.CallbackQuery, product_id: int):
-    """🔄 Обновление сообщения с товаром (актуальные данные из БД)"""
-    # 🔄 Получаем АКТУАЛЬНЫЕ данные из БД
+    """🔄 Обновление сообщения с товаром (с учетом корзины)"""
+    # Получаем данные о товаре
     product = await db.get_product(product_id)
     if not product:
         return
@@ -260,26 +265,28 @@ async def update_product_message(callback: types.CallbackQuery, product_id: int)
     cart_item = next((item for item in cart if item['product_id'] == product_id), None)
     in_cart = cart_item['quantity'] if cart_item else 0
 
-    # Формируем текст с актуальными данными
+    # 🔄 Вычисляем доступный остаток (с учетом корзины)
+    available_stock = product['stock'] - in_cart
+
+    # Формируем текст
     text = (
         f"📦 <b>{product['name']}</b>\n\n"
         f"📝 {product['description'] or 'Описание отсутствует'}\n\n"
         f"💰 Цена: <b>{product['price']}₽</b>\n"
-        f"📦 В наличии: <b>{product['stock']} шт.</b>\n"
+        f"📦 В наличии: <b>{available_stock} шт.</b>\n"
     )
 
     if in_cart > 0:
-        text += f"\n🛒 <b>В корзине: {in_cart} шт.</b>"
+        text += f"🛒 <b>В вашей корзине: {in_cart} шт.</b>\n"
 
     # Обновляем сообщение с новой клавиатурой
     try:
         await callback.message.edit_text(
             text,
-            reply_markup=kb.get_product_keyboard(product_id, product['stock'], in_cart),
+            reply_markup=kb.get_product_keyboard(product_id, available_stock, in_cart),
             parse_mode="HTML"
         )
     except Exception as e:
-        # Игнорируем ошибку, если текст не изменился
         logging.debug(f"Не удалось обновить сообщение: {e}")
 
 
@@ -361,7 +368,7 @@ async def order_pay(callback: types.CallbackQuery):
     bonus = await db.get_active_bonus(user_id)
 
     # Создаем заказ
-    order_number = await db.create_order(user_id, cart, bonus or 0)  # ✅ await!
+    order_number = await db.create_order(user_id, cart, bonus or 0)
 
     if not order_number:
         await callback.answer("❌ Ошибка создания заказа", show_alert=True)
@@ -374,10 +381,20 @@ async def order_pay(callback: types.CallbackQuery):
     # Очистка корзины
     await db.clear_cart(user_id)
 
-    # Формирование сообщения об оплате
+    # 🔔 ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ АДМИНАМ
     total = sum(item['price'] * item['quantity'] for item in cart)
     final = total - (total * (bonus or 0) // 100)
 
+    await notify_admins_about_order(
+        order_number=order_number,
+        user_id=user_id,
+        total=total,
+        final=final,
+        discount=bonus or 0,
+        cart=cart
+    )
+
+    # Формирование сообщения для пользователя
     payment_text = (
         f"✅ <b>Заказ #{order_number} создан!</b>\n\n"
         f"💳 <b>Оплата переводом:</b>\n"
@@ -1117,6 +1134,185 @@ async def admin_orders(message: types.Message):
     )
 
 
+
+
+
+async def notify_admins_about_order(order_number: str, user_id: int,
+                                    total: int, final: int,
+                                    discount: int, cart: List[Dict]):
+    """Отправка уведомления всем администраторам о новом заказе"""
+
+    # Получаем всех админов
+    admin_ids = await db.get_all_admin_ids()
+
+    # Добавляем главного админа из ADMIN_ID
+    if ADMIN_ID not in admin_ids:
+        admin_ids.append(ADMIN_ID)
+
+    # Формируем текст уведомления
+    text = (
+        f"🔔 <b>НОВЫЙ ЗАКАЗ!</b>\n\n"
+        f"📋 <b>Заказ #{order_number}</b>\n"
+        f"👤 <b>Заказчик:</b> ID {user_id}\n\n"
+        f"<b>📦 Товары:</b>\n"
+    )
+
+    for item in cart:
+        subtotal = item['price'] * item['quantity']
+        text += f"• {item['name']} × {item['quantity']} шт. = {subtotal}₽\n"
+
+    text += f"\n💰 <b>Сумма:</b> {total}₽\n"
+
+    if discount > 0:
+        text += f"🎁 <b>Скидка:</b> {discount}%\n"
+
+    text += f"✅ <b>К оплате:</b> {final}₽\n\n"
+    text += f"⏳ <b>Статус:</b> Ожидает оплаты"
+
+    # Отправляем уведомление каждому админу (БЕЗ клавиатуры)
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="HTML"
+                # ❌ Убрали reply_markup
+            )
+            logging.info(f"✅ Уведомление отправлено админу {admin_id}")
+        except Exception as e:
+            logging.error(f"❌ Не удалось отправить уведомление админу {admin_id}: {e}")
+
+
+# ==================== УДАЛЕНИЕ ЗАКАЗА ====================
+
+@dp.callback_query(F.data.startswith("admin:order:delete:confirm:"))
+async def admin_order_delete_execute(callback: types.CallbackQuery):
+    """Фактическое удаление заказа"""
+    # Разбираем callback: admin:order:delete:confirm:ORDER-000001
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        await callback.answer("❌ Ошибка формата", show_alert=True)
+        return
+
+    order_number = parts[4]
+    logging.info(f"🗑️ Выполняем удаление: {order_number}")
+
+    # Удаляем
+    success = await db.delete_order(order_number)
+
+    if success:
+        logging.info(f"✅ Заказ {order_number} удалён")
+        await callback.answer(f"✅ Заказ {order_number} удалён!", show_alert=True)
+
+        # Получаем обновлённый список
+        orders = await db.get_all_orders()
+
+        if not orders:
+            await callback.message.edit_text(
+                "📋 Заказов пока нет",
+                reply_markup=kb.get_back_keyboard()
+            )
+            return
+
+        # Показываем обновлённый список
+        await callback.message.edit_text(
+            "📋 <b>История заказов:</b>\n\nВыберите заказ:",
+            reply_markup=kb.get_orders_keyboard(orders),
+            parse_mode="HTML"
+        )
+    else:
+        logging.error(f"❌ Не удалось удалить {order_number}")
+        await callback.answer("❌ Ошибка при удалении", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin:order:delete:"))
+async def admin_order_delete_confirm(callback: types.CallbackQuery):
+    """Показ подтверждения удаления"""
+    # Разбираем callback: admin:order:delete:ORDER-000001
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.answer("❌ Ошибка формата", show_alert=True)
+        return
+
+    order_number = parts[3]
+
+    # Проверяем, не confirm ли это (чтобы не зациклиться)
+    if len(parts) > 4 and parts[4] == "confirm":
+        return
+
+    logging.info(f"🗑️ Запрошено удаление: {order_number}")
+
+    # Получаем заказ
+    order = await db.get_order(order_number)
+    if not order:
+        await callback.answer("❌ Заказ не найден", show_alert=True)
+        return
+
+    # Текст подтверждения
+    text = (
+        f"🗑️ <b>Удаление заказа</b>\n\n"
+        f"📋 Заказ: <b>#{order_number}</b>\n"
+        f"💰 Сумма: {order['final_price']}₽\n\n"
+        f"⚠️ <b>Удалить этот заказ?</b>\n"
+        f"Действие необратимо!"
+    )
+
+    # Кнопки
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"admin:order:delete:confirm:{order_number}"),
+        InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"admin:order:{order_number}")
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+
+
+@dp.callback_query(F.data.startswith("admin:order:cancel:"))
+async def admin_order_cancel(callback: types.CallbackQuery):
+    """Отмена заказа (меняет статус, но не удаляет)"""
+    parts = callback.data.split(":")
+
+    # Проверяем, что это не confirm удаления
+    if len(parts) > 3 and parts[3] == "confirm":
+        return
+
+    order_number = parts[3]
+
+    # Меняем статус на cancelled
+    await db.update_order_status(order_number, "cancelled")
+
+    await callback.answer(f"✅ Статус заказа изменён на cancelled", show_alert=False)
+
+    # Обновляем информацию о заказе
+    order = await db.get_order(order_number)
+
+    if order:
+        text = f"📦 <b>Заказ {order['order_number']}</b>\n"
+        text += f"👤 Пользователь: {order.get('username') or order['user_id']}\n"
+        text += f"📅 Дата: {order['created_at']}\n"
+        text += f"📊 Статус: {order['status']}\n\n"
+        text += "<b>Товары:</b>\n"
+
+        for item in order['items']:
+            text += f"• {item['product_name']} × {item['quantity']} = {item['subtotal']}₽\n"
+
+        text += f"\n💰 Сумма: {order['total_price']}₽\n"
+        if order['discount_percent']:
+            text += f"🎁 Скидка {order['discount_percent']}%\n"
+        text += f"✅ <b>К оплате: {order['final_price']}₽</b>"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb.get_order_admin_keyboard(order_number),
+            parse_mode="HTML"
+        )
+
 @dp.callback_query(F.data.startswith("admin:order:"))
 async def admin_order_view(callback: types.CallbackQuery):
     """Просмотр заказа админом"""
@@ -1164,7 +1360,6 @@ async def admin_order_view(callback: types.CallbackQuery):
 
         orders = await db.get_all_orders()
         await callback.message.edit_reply_markup(reply_markup=kb.get_orders_keyboard(orders))
-
 
 # ==================== CATCH ALL CALLBACKS ====================
 @dp.callback_query(F.data == "menu:main")

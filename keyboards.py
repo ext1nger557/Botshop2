@@ -307,5 +307,22 @@ def get_order_admin_keyboard(order_number: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"admin:order:confirm:{order_number}"),
         InlineKeyboardButton(text="❌ Отменить", callback_data=f"admin:order:cancel:{order_number}")
     )
+    builder.row(
+        InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"admin:order:delete:{order_number}")  # ✅ DELETE
+    )
     builder.row(InlineKeyboardButton(text="🔙 К заказам", callback_data="admin:orders"))
+    return builder.as_markup()
+
+
+def get_admin_order_keyboard(order_number: str) -> InlineKeyboardMarkup:
+    """Клавиатура для уведомления о заказе"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"admin:order:confirm:{order_number}"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data=f"admin:order:cancel:{order_number}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"admin:order:delete:{order_number}")
+    )
+    builder.row(InlineKeyboardButton(text="📋 Открыть заказ", callback_data=f"admin:order:{order_number}"))
     return builder.as_markup()

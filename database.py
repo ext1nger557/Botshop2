@@ -2,7 +2,6 @@ import aiosqlite
 import os
 from datetime import datetime
 from typing import Optional, List, Dict
-
 DB_PATH = "shop_bot.db"
 
 
@@ -398,11 +397,12 @@ async def reduce_stock(product_id: int, quantity: int):
 
 # ==================== CART ====================
 async def add_to_cart(user_id: int, product_id: int, quantity: int = 1):
+    """Добавление товара в корзину (БЕЗ изменения остатка в БД)"""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверка наличия товара
+        # Проверка наличия товара (проверяем общий остаток)
         cursor = await db.execute("SELECT stock FROM products WHERE id = ?", (product_id,))
         result = await cursor.fetchone()
-        if not result or result[0] < quantity:
+        if not result or result[0] < 1:  # Проверяем, есть ли хоть 1 штука
             return False
 
         # Добавление или обновление в корзине
@@ -413,12 +413,8 @@ async def add_to_cart(user_id: int, product_id: int, quantity: int = 1):
                          UPDATE SET quantity = quantity + ?
                          """, (user_id, product_id, quantity, quantity))
 
-        # ✅ УМЕНЬШАЕМ остаток товара на складе
-        await db.execute("""
-                         UPDATE products
-                         SET stock = stock - ?
-                         WHERE id = ?
-                         """, (quantity, product_id))
+        # ❌ НЕ УМЕНЬШАЕМ остаток в БД!
+        # await db.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (quantity, product_id))
 
         await db.commit()
         return True
@@ -625,6 +621,7 @@ async def create_order(user_id: int, cart_items: List[Dict],
 
 
 async def get_order(order_number: str) -> Optional[Dict]:
+    """Получение информации о заказе"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
@@ -633,6 +630,7 @@ async def get_order(order_number: str) -> Optional[Dict]:
                                   WHERE order_number = ?
                                   """, (order_number,))
         order = await cursor.fetchone()
+
         if not order:
             return None
 
@@ -650,23 +648,22 @@ async def get_order(order_number: str) -> Optional[Dict]:
 
 
 async def get_all_orders() -> List[Dict]:
+    """Получение всех заказов"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
-                                  SELECT o.*, u.username, u.first_name
-                                  FROM orders o
-                                           JOIN users u ON o.user_id = u.user_id
-                                  ORDER BY o.created_at DESC
-                                  """)
+            SELECT o.*, u.username, u.first_name 
+            FROM orders o 
+            JOIN users u ON o.user_id = u.user_id 
+            ORDER BY o.created_at DESC
+        """)
         orders = []
         for row in await cursor.fetchall():
             order = dict(row)
             # Получение позиций
             cursor_items = await db.execute("""
-                                            SELECT *
-                                            FROM order_items
-                                            WHERE order_id = ?
-                                            """, (order['id'],))
+                SELECT * FROM order_items WHERE order_id = ?
+            """, (order['id'],))
             order['items'] = [dict(item) for item in await cursor_items.fetchall()]
             orders.append(order)
         return orders
@@ -680,3 +677,52 @@ async def update_order_status(order_number: str, status: str):
                          WHERE order_number = ?
                          """, (status, order_number))
         await db.commit()
+
+async def get_all_admin_ids() -> List[int]:
+    """Получение всех ID администраторов"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE is_admin = 1")
+        results = await cursor.fetchall()
+        return [row[0] for row in results]
+
+
+async def delete_order(order_number: str) -> bool:
+    """Полное удаление заказа и его позиций"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Получаем ID заказа
+            cursor = await db.execute(
+                "SELECT id FROM orders WHERE order_number = ?",
+                (order_number,)
+            )
+            result = await cursor.fetchone()
+
+            if not result:
+                print(f"❌ Заказ {order_number} не найден в БД")
+                return False
+
+            order_id = result[0]
+            print(f"🗑️ Удаляем заказ ID={order_id}, номер={order_number}")
+
+            # Удаляем позиции заказа
+            await db.execute(
+                "DELETE FROM order_items WHERE order_id = ?",
+                (order_id,)
+            )
+            print(f"🗑️ Удалены позиции заказа {order_id}")
+
+            # Удаляем сам заказ
+            await db.execute(
+                "DELETE FROM orders WHERE id = ?",
+                (order_id,)
+            )
+            print(f"🗑️ Удален заказ {order_id}")
+
+            await db.commit()
+            return True
+
+    except Exception as e:
+        print(f"❌ Ошибка при удалении заказа: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
