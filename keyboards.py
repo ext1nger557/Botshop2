@@ -107,14 +107,17 @@ def get_cart_keyboard(cart_items: list) -> InlineKeyboardMarkup:
     """Клавиатура корзины"""
     builder = InlineKeyboardBuilder()
 
+    # Кнопки для каждого товара
     for item in cart_items:
         builder.row(InlineKeyboardButton(
             text=f"❌ {item['name']} ({item['quantity']}шт)",
             callback_data=f"cart:remove:{item['product_id']}"
         ))
 
+    builder.row(InlineKeyboardButton(text="🧹 Очистить корзину", callback_data="cart:clear"))
     builder.row(InlineKeyboardButton(text="✅ Оформить заказ", callback_data="order:checkout"))
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu:main"))
+
     return builder.as_markup()
 
 
@@ -168,6 +171,7 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     builder.row(KeyboardButton(text="🗑️ Удалить товар"), KeyboardButton(text="💰 Изменить цену"))
     builder.row(KeyboardButton(text="👥 Список админов"), KeyboardButton(text="🎁 Система бонусов"))
     builder.row(KeyboardButton(text="🚫 ЧС пользователей"), KeyboardButton(text="📋 История заказов"))
+    builder.row(KeyboardButton(text="🔧 Техработы"))  # ✅ Новая кнопка
     builder.row(KeyboardButton(text="🔙 В главное меню"))
     return builder.as_markup(resize_keyboard=True)
 
@@ -368,3 +372,37 @@ def get_bonus_choice_keyboard(use_bonus: bool) -> InlineKeyboardMarkup:
     ))
 
     return builder.as_markup()
+
+
+def get_admin_products_price_keyboard(products: list) -> InlineKeyboardMarkup:
+    """Клавиатура выбора товара для изменения цены"""
+    builder = InlineKeyboardBuilder()
+
+    for product in products:
+        builder.row(InlineKeyboardButton(
+            text=f"{product['name']} ({product['price']}₽)",
+            callback_data=f"admin:price:product:{product['id']}"
+        ))
+
+    builder.row(InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin:menu"))
+    return builder.as_markup()
+
+
+def get_maintenance_keyboard(is_maintenance: bool) -> InlineKeyboardMarkup:
+    """Клавиатура управления режимом техработ"""
+    builder = InlineKeyboardBuilder()
+
+    if is_maintenance:
+        builder.row(InlineKeyboardButton(
+            text="✅ Выключить техработы",
+            callback_data="maintenance:toggle:off"
+        ))
+    else:
+        builder.row(InlineKeyboardButton(
+            text="❌ Включить техработы",
+            callback_data="maintenance:toggle:on"
+        ))
+
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin:menu"))
+    return builder.as_markup()
+

@@ -54,6 +54,7 @@ class AdminStates(StatesGroup):
     adding_stock = State()
     deleting_product = State()
     changing_price = State()
+    changing_price_input = State()  # ✅ Добавьте это!
     adding_admin = State()
     removing_admin = State()
     adding_bonus = State()
@@ -124,8 +125,11 @@ async def back_to_menu(message: types.Message, state: FSMContext):
 @dp.message(F.text == "🛍️ Каталог")
 async def show_catalog(message: types.Message):
     """Отображение каталога товаров"""
+    if await check_maintenance(message):
+        return
     if await check_banned(message):
         return
+
 
     products = await db.get_all_products()
 
@@ -161,6 +165,8 @@ async def back_to_catalog(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("product:"))
 async def show_product(callback: types.CallbackQuery):
     """Показ деталей товара с учетом товаров в корзине"""
+    if await check_maintenance_callback(callback):
+        return
     product_id = int(callback.data.split(":")[1])
     product = await db.get_product(product_id)
 
@@ -197,6 +203,8 @@ async def show_product(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("cart:add:"))
 async def cart_add(callback: types.CallbackQuery):
     """Добавление товара в корзину (+)"""
+    if await check_maintenance_callback(callback):
+        return
     parts = callback.data.split(":")
     product_id = int(parts[2])
 
@@ -303,6 +311,8 @@ async def update_product_message(callback: types.CallbackQuery, product_id: int)
 @dp.message(F.text == "🛒 Корзина")
 async def show_cart(message: types.Message):
     """Отображение корзины"""
+    if await check_maintenance(message):
+        return
     if await check_banned(message):
         return
 
@@ -324,12 +334,87 @@ async def show_cart(message: types.Message):
     await message.answer(text, reply_markup=kb.get_cart_keyboard(cart), parse_mode="HTML")
 
 
+@dp.callback_query(F.data.startswith("cart:remove:"))
+async def cart_remove_item(callback: types.CallbackQuery):
+    """Удаление товара из корзины"""
+    try:
+        # Разбираем callback data
+        parts = callback.data.split(":")
+        logging.info(f"🔍 Callback data: {callback.data}")
+        logging.info(f"🔍 Parts: {parts}")
+
+        if len(parts) < 3:
+            await callback.answer("❌ Ошибка формата", show_alert=True)
+            return
+
+        product_id = int(parts[2])
+        user_id = callback.from_user.id
+
+        logging.info(f"🗑️ Удаляем товар {product_id} из корзины пользователя {user_id}")
+
+        # ✅ Вызываем функцию из database.py
+        await db.remove_from_cart(user_id, product_id)
+
+        await callback.answer("✅ Товар удален", show_alert=False)
+
+        # Получаем обновленную корзину
+        cart = await db.get_cart(user_id)
+
+        if not cart:
+            # Корзина пуста
+            await callback.message.edit_text(
+                "🛒 Ваша корзина пуста",
+                reply_markup=kb.get_back_keyboard()
+            )
+            return
+
+        # Формируем текст корзины
+        total = sum(item['price'] * item['quantity'] for item in cart)
+
+        text = "🛒 <b>Ваша корзина:</b>\n\n"
+        for item in cart:
+            subtotal = item['price'] * item['quantity']
+            text += f"• {item['name']} × {item['quantity']} шт. = <b>{subtotal}₽</b>\n"
+
+        text += f"\n💰 <b>Итого: {total}₽</b>"
+
+        # Обновляем сообщение
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb.get_cart_keyboard(cart),
+            parse_mode="HTML"
+        )
+
+    except ValueError:
+        logging.error("❌ Ошибка преобразования product_id")
+        await callback.answer("❌ Ошибка при удалении товара", show_alert=True)
+    except Exception as e:
+        logging.error(f"❌ Ошибка при удалении товара: {e}")
+        import traceback
+        traceback.print_exc()
+        await callback.answer("❌ Ошибка при удалении товара", show_alert=True)
+
+
 @dp.callback_query(F.data == "cart:clear")
 async def cart_clear(callback: types.CallbackQuery):
     """Очистка корзины"""
-    await db.clear_cart(callback.from_user.id)
-    await callback.answer("🧹 Корзина очищена")
-    await callback.message.edit_text("🛒 Ваша корзина пуста", reply_markup=kb.get_back_keyboard())
+    try:
+        user_id = callback.from_user.id
+
+        # Очищаем корзину
+        await db.clear_cart(user_id)
+
+        await callback.answer("🗑️ Корзина очищена", show_alert=True)
+
+        # Показываем пустую корзину
+        await callback.message.edit_text(
+            "🛒 Ваша корзина пуста",
+            reply_markup=kb.get_back_keyboard()
+        )
+
+    except Exception as e:
+        logging.error(f"❌ Ошибка при очистке корзины: {e}")
+        await callback.answer("❌ Ошибка при очистке корзины", show_alert=True)
 
 
 @dp.callback_query(F.data == "order:checkout")
@@ -413,12 +498,20 @@ async def order_pay(callback: types.CallbackQuery):
         await callback.answer("Корзина пуста!", show_alert=True)
         return
 
+    logging.info(f"📋 Оформление заказа пользователем {user_id}")
+
     # Получаем активный бонус и настройку использования
     bonus = await db.get_active_bonus(user_id)
     use_bonus = await db.get_bonus_usage(user_id)
 
+    # ✅ Безопасная обработка бонуса
+    if bonus is None:
+        bonus = 0
+
     # Если пользователь выбрал не использовать скидку - обнуляем бонус
     final_bonus = bonus if use_bonus else 0
+
+    logging.info(f"💰 Bonus: {bonus}, Use bonus: {use_bonus}, Final bonus: {final_bonus}")
 
     # Создаем заказ
     order_number = await db.create_order(user_id, cart, final_bonus)
@@ -426,6 +519,23 @@ async def order_pay(callback: types.CallbackQuery):
     if not order_number:
         await callback.answer("❌ Ошибка создания заказа", show_alert=True)
         return
+
+    logging.info(f"✅ Заказ {order_number} создан")
+
+    # 🔔 ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ АДМИНАМ
+    total = sum(item['price'] * item['quantity'] for item in cart)
+    final = total - (total * final_bonus // 100)
+
+    logging.info(f"🔔 Отправляем уведомления о заказе {order_number}")
+
+    await notify_admins_about_order(
+        order_number=order_number,
+        user_id=user_id,
+        total=total,
+        final=final,
+        discount=final_bonus,
+        cart=cart
+    )
 
     # Деактивация бонуса после использования (только если использовали)
     if use_bonus and bonus:
@@ -476,9 +586,110 @@ async def order_pay(callback: types.CallbackQuery):
     )
 
 
+@dp.message(F.text == "💰 Изменить цену")
+async def admin_change_price_start(message: types.Message, state: FSMContext):
+    """Начало изменения цены - показываем список товаров"""
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id == ADMIN_ID):
+        return
+
+    products = await db.get_all_products()
+    if not products:
+        await message.answer("📭 Нет товаров для изменения цены", reply_markup=kb.get_admin_keyboard())
+        return
+
+    await message.answer(
+        "💰 <b>Выберите товар для изменения цены:</b>",
+        reply_markup=kb.get_admin_products_price_keyboard(products),
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.changing_price)
+
+
+@dp.callback_query(F.data.startswith("admin:price:product:"))
+async def admin_price_product_select(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор товара для изменения цены"""
+    product_id = int(callback.data.split(":")[3])
+    product = await db.get_product(product_id)
+
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+
+    # Сохраняем ID товара в состоянии
+    await state.update_data(product_id=product_id, product_name=product['name'])
+
+    text = (
+        f"💰 <b>Изменение цены товара</b>\n\n"
+        f"📦 <b>{product['name']}</b>\n"
+        f"💰 Текущая цена: {product['price']}₽\n\n"
+        f"💵 Введите новую цену:\n"
+        f"Или нажмите кнопку 'Назад' под сообщением"
+    )
+
+    # ✅ ИСПОЛЬЗУЕМ answer() вместо edit_text() для отправки нового сообщения
+    await callback.message.answer(
+        text,
+        reply_markup=kb.get_back_reply_keyboard(),
+        parse_mode="HTML"
+    )
+
+    # ✅ Отвечаем на callback
+    await callback.answer()
+
+    # ✅ Устанавливаем состояние
+    await state.set_state(AdminStates.changing_price_input)
+
+@dp.message(AdminStates.changing_price_input)
+async def admin_price_change_process(message: types.Message, state: FSMContext):
+    """Процесс изменения цены"""
+    if message.text == "🔙 Назад в меню":
+        await state.clear()
+        is_admin = await db.is_admin(message.from_user.id) or (message.from_user.id == ADMIN_ID)
+        await message.answer(
+            "⚙️ <b>Панель администратора</b>\n\nВыберите действие:",
+            reply_markup=kb.get_admin_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    if not message.text.isdigit():
+        await message.answer("❌ Введите корректную цену (число больше 0):")
+        return
+
+    new_price = int(message.text)
+    if new_price <= 0:
+        await message.answer("❌ Цена должна быть больше 0:")
+        return
+
+    # Получаем данные из состояния
+    data = await state.get_data()
+    product_id = data.get('product_id')
+    product_name = data.get('product_name')
+
+    if not product_id:
+        await message.answer("❌ Ошибка: товар не выбран", reply_markup=kb.get_admin_keyboard())
+        await state.clear()
+        return
+
+    # Обновляем цену в БД
+    await db.update_price(product_id, new_price)
+
+    await message.answer(
+        f"✅ <b>Цена товара \"{product_name}\" изменена!</b>\n\n"
+        f"💰 Старая цена: не указана\n"
+        f"💵 <b>Новая цена: {new_price}₽</b>",
+        reply_markup=kb.get_admin_keyboard(),
+        parse_mode="HTML"
+    )
+
+    await state.clear()
+
+
 @dp.message(F.text == "🎁 Бонусы")
 async def show_bonuses(message: types.Message):
     """Отображение бонусов пользователя"""
+    if await check_maintenance(message):
+        return
     if await check_banned(message):
         return
 
@@ -1454,6 +1665,112 @@ async def admin_back_to_main(message: types.Message, state: FSMContext):
     await message.answer(
         "📋 Главное меню:",
         reply_markup=kb.get_main_keyboard(message.from_user.id, is_admin)
+    )
+
+
+async def check_maintenance(message: types.Message) -> bool:
+    """Проверка режима техработ для пользователей"""
+    # Админы могут использовать бота даже во время техработ
+    if await db.is_admin(message.from_user.id) or (message.from_user.id == ADMIN_ID):
+        return False
+
+    # Проверяем режим техработ
+    if await db.get_maintenance_mode():
+        await message.answer(
+            "🔧 <b>Технические работы</b>\n\n"
+            "В данный момент бот находится на техническом обслуживании.\n"
+            "Пожалуйста, попробуйте позже.\n\n"
+            "📞 По вопросам: @romasha_1",
+            parse_mode="HTML"
+        )
+        return True
+
+    return False
+
+
+async def check_maintenance_callback(callback: types.CallbackQuery) -> bool:
+    """Проверка режима техработ для callback запросов"""
+    # Админы могут использовать бота даже во время техработ
+    if await db.is_admin(callback.from_user.id) or (callback.from_user.id == ADMIN_ID):
+        return False
+
+    # Проверяем режим техработ
+    if await db.get_maintenance_mode():
+        await callback.answer(
+            "🔧 Технические работы. Попробуйте позже.",
+            show_alert=True
+        )
+        return True
+
+    return False
+
+
+# ==================== РЕЖИМ ТЕХРАБОТ ====================
+
+@dp.message(F.text == "🔧 Техработы")
+async def admin_maintenance_start(message: types.Message):
+    """Управление режимом техработ"""
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id == ADMIN_ID):
+        return
+
+    is_maintenance = await db.get_maintenance_mode()
+
+    status_text = "🟢 ВКЛЮЧЕН" if is_maintenance else "🔴 ВЫКЛЮЧЕН"
+
+    text = (
+        f"🔧 <b>Режим технических работ</b>\n\n"
+        f"📊 <b>Текущий статус:</b> {status_text}\n\n"
+        f"⚠️ <b>Внимание!</b>\n"
+        f"При включении режима техработ обычные пользователи\n"
+        f"не смогут использовать бота.\n\n"
+        f"Администраторы могут использовать бота в любом режиме."
+    )
+
+    await message.answer(
+        text,
+        reply_markup=kb.get_maintenance_keyboard(is_maintenance),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("maintenance:toggle:"))
+async def admin_maintenance_toggle(callback: types.CallbackQuery):
+    """Переключение режима техработ"""
+    if not (await db.is_admin(callback.from_user.id) or callback.from_user.id == ADMIN_ID):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    action = callback.data.split(":")[2]
+    enable = (action == "on")
+
+    # Устанавливаем режим
+    await db.set_maintenance_mode(enable)
+
+    status_text = "✅ ВКЛЮЧЕН" if enable else "❌ ВЫКЛЮЧЕН"
+
+    await callback.answer(
+        f"Режим техработ {status_text}",
+        show_alert=True
+    )
+
+    # Обновляем клавиатуру
+    is_maintenance = await db.get_maintenance_mode()
+
+    status_text = "🟢 ВКЛЮЧЕН" if is_maintenance else "🔴 ВЫКЛЮЧЕН"
+
+    text = (
+        f"🔧 <b>Режим технических работ</b>\n\n"
+        f"📊 <b>Текущий статус:</b> {status_text}\n\n"
+        f"⚠️ <b>Внимание!</b>\n"
+        f"При включении режима техработ обычные пользователи\n"
+        f"не смогут использовать бота.\n\n"
+        f"Администраторы могут использовать бота в любом режиме."
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=kb.get_maintenance_keyboard(is_maintenance),
+        parse_mode="HTML"
     )
 
 # ==================== CATCH ALL CALLBACKS ====================

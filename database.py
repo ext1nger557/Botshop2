@@ -258,6 +258,14 @@ async def init_db():
                              )
                          """)
 
+        # ✅ Таблица настроек (для режима техработ)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
         await db.commit()
     print("✅ База данных инициализирована")
 
@@ -420,27 +428,35 @@ async def reduce_stock(product_id: int, quantity: int):
 
 # ==================== CART ====================
 async def add_to_cart(user_id: int, product_id: int, quantity: int = 1):
-    """Добавление товара в корзину (БЕЗ изменения остатка в БД)"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Проверка наличия товара (проверяем общий остаток)
-        cursor = await db.execute("SELECT stock FROM products WHERE id = ?", (product_id,))
-        result = await cursor.fetchone()
-        if not result or result[0] < 1:  # Проверяем, есть ли хоть 1 штука
-            return False
+    """Добавление товара в корзину (БЕЗ изменения остатка)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Проверяем наличие товара
+            cursor = await db.execute(
+                "SELECT stock FROM products WHERE id = ?",
+                (product_id,)
+            )
+            result = await cursor.fetchone()
 
-        # Добавление или обновление в корзине
-        await db.execute("""
-                         INSERT INTO cart (user_id, product_id, quantity)
-                         VALUES (?, ?, ?) ON CONFLICT(user_id, product_id) 
-            DO
-                         UPDATE SET quantity = quantity + ?
-                         """, (user_id, product_id, quantity, quantity))
+            if not result or result[0] < quantity:
+                return False
 
-        # ❌ НЕ УМЕНЬШАЕМ остаток в БД!
-        # await db.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (quantity, product_id))
+            # Добавляем или обновляем в корзине
+            await db.execute("""
+                             INSERT INTO cart (user_id, product_id, quantity)
+                             VALUES (?, ?, ?) ON CONFLICT(user_id, product_id) 
+                DO
+                             UPDATE SET quantity = quantity + ?
+                             """, (user_id, product_id, quantity, quantity))
 
-        await db.commit()
-        return True
+            # ✅ НЕ УМЕНЬШАЕМ остаток! Только при оформлении заказа
+            # await db.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (quantity, product_id))
+
+            await db.commit()
+            return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка при добавлении в корзину: {e}")
+        return False
 
 
 async def get_cart(user_id: int) -> List[Dict]:
@@ -456,85 +472,83 @@ async def get_cart(user_id: int) -> List[Dict]:
 
 
 async def remove_from_cart(user_id: int, product_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Получаем количество товара в корзине
-        cursor = await db.execute("""
-                                  SELECT quantity
-                                  FROM cart
-                                  WHERE user_id = ?
-                                    AND product_id = ?
-                                  """, (user_id, product_id))
-        result = await cursor.fetchone()
-
-        if result:
-            quantity = result[0]
-            # ✅ ВОССТАНАВЛИВАЕМ остаток товара на складе
+    """Удаление товара из корзины (БЕЗ изменения остатка)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # ✅ Просто удаляем товар из корзины
+            # НЕ восстанавливаем остаток, так как при добавлении он не уменьшался
             await db.execute("""
-                             UPDATE products
-                             SET stock = stock + ?
-                             WHERE id = ?
-                             """, (quantity, product_id))
+                             DELETE
+                             FROM cart
+                             WHERE user_id = ?
+                               AND product_id = ?
+                             """, (user_id, product_id))
 
-        # Удаляем из корзины
-        await db.execute("""
-                         DELETE
-                         FROM cart
-                         WHERE user_id = ?
-                           AND product_id = ?
-                         """, (user_id, product_id))
-        await db.commit()
+            await db.commit()
+
+            logging.info(f"🗑️ Товар {product_id} удален из корзины пользователя {user_id}")
+    except Exception as e:
+        logging.error(f"❌ Ошибка при удалении из корзины: {e}")
 
 
 async def clear_cart(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
-        await db.commit()
+    """Очистка корзины пользователя (БЕЗ изменения остатка)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # ✅ Просто удаляем все товары из корзины
+            # НЕ восстанавливаем остаток, так как при добавлении он не уменьшался
+            await db.execute("""
+                             DELETE
+                             FROM cart
+                             WHERE user_id = ?
+                             """, (user_id,))
+
+            await db.commit()
+
+            logging.info(f"🗑️ Корзина пользователя {user_id} очищена")
+    except Exception as e:
+        logging.error(f"❌ Ошибка при очистке корзины: {e}")
 
 
 async def update_cart_quantity(user_id: int, product_id: int, quantity: int):
-    """Обновление количества товара в корзине"""
-    if quantity <= 0:
-        await remove_from_cart(user_id, product_id)
-    else:
+    """Обновление количества товара в корзине (БЕЗ изменения остатка)"""
+    try:
         async with aiosqlite.connect(DB_PATH) as db:
-            # Получаем старое количество
-            cursor = await db.execute("""
-                                      SELECT quantity
-                                      FROM cart
-                                      WHERE user_id = ?
-                                        AND product_id = ?
-                                      """, (user_id, product_id))
-            result = await cursor.fetchone()
+            if quantity <= 0:
+                # Удаляем товар
+                await db.execute("""
+                                 DELETE
+                                 FROM cart
+                                 WHERE user_id = ?
+                                   AND product_id = ?
+                                 """, (user_id, product_id))
+            else:
+                # Обновляем количество
+                await db.execute("""
+                                 UPDATE cart
+                                 SET quantity = ?
+                                 WHERE user_id = ?
+                                   AND product_id = ?
+                                 """, (quantity, user_id, product_id))
 
-            if result:
-                old_qty = result[0]
-                diff = old_qty - quantity
-
-                # Обновляем остаток на складе
-                if diff > 0:
-                    # Уменьшили в корзине → увеличиваем на складе
-                    await db.execute("""
-                                     UPDATE products
-                                     SET stock = stock + ?
-                                     WHERE id = ?
-                                     """, (diff, product_id))
-                elif diff < 0:
-                    # Увеличили в корзине → уменьшаем на складе
-                    await db.execute("""
-                                     UPDATE products
-                                     SET stock = stock - ?
-                                     WHERE id = ?
-                                     """, (abs(diff), product_id))
-
-            # Обновляем количество в корзине
-            await db.execute("""
-                             UPDATE cart
-                             SET quantity = ?
-                             WHERE user_id = ?
-                               AND product_id = ?
-                             """, (quantity, user_id, product_id))
             await db.commit()
+    except Exception as e:
+        logging.error(f"❌ Ошибка при обновлении количества: {e}")
 
+
+async def update_price(product_id: int, new_price: int) -> bool:
+    """Обновление цены товара"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE products SET price = ? WHERE id = ?
+            """, (new_price, product_id))
+            await db.commit()
+            logging.info(f"💰 Цена товара ID={product_id} изменена на {new_price}₽")
+            return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка при изменении цены: {e}")
+        return False
 
 # ==================== BONUSES ====================
 async def add_bonus(user_id: int, discount_percent: int):
@@ -593,46 +607,27 @@ async def create_order(user_id: int, cart_items: List[Dict],
                        discount_percent: int = 0) -> Optional[str]:
     """Создание заказа с возвратом номера заказа"""
     try:
+        import uuid
+        import time
+
+        # ✅ Обрабатываем None значение скидки
+        if discount_percent is None:
+            discount_percent = 0
+
         async with aiosqlite.connect(DB_PATH) as db:
             # Подсчет суммы
             total_price = sum(item['price'] * item['quantity'] for item in cart_items)
+
+            # ✅ Безопасный расчет скидки
+            discount_percent = int(discount_percent) if discount_percent else 0
             final_price = total_price - (total_price * discount_percent // 100)
 
-            # Генерация УНИКАЛЬНОГО номера заказа
-            order_number = None
-            max_attempts = 100  # Максимум попыток генерации
+            logging.info(f"📋 Создаем заказ. Total: {total_price}, Discount: {discount_percent}%, Final: {final_price}")
 
-            for attempt in range(max_attempts):
-                # Получаем текущее количество заказов
-                cursor = await db.execute("SELECT COUNT(*) FROM orders")
-                result = await cursor.fetchone()
-                order_count = result[0] + 1
-
-                # Генерируем номер заказа с timestamp для уникальности
-                import time
-                timestamp = int(time.time() * 1000) % 1000000  # Последние 6 цифр timestamp
-                order_number = f"ORDER-{timestamp:06d}"
-
-                # Проверяем, существует ли уже такой номер
-                cursor = await db.execute(
-                    "SELECT id FROM orders WHERE order_number = ?",
-                    (order_number,)
-                )
-                exists = await cursor.fetchone()
-
-                if not exists:
-                    # Номер уникален, выходим из цикла
-                    break
-
-                # Если номер занят, ждем немного и пробуем снова
-                import asyncio
-                await asyncio.sleep(0.01)
-
-            if not order_number:
-                logging.error("❌ Не удалось сгенерировать уникальный номер заказа")
-                return None
-
-            logging.info(f"📋 Создаем заказ {order_number} для пользователя {user_id}")
+            # Генерация уникального номера заказа
+            timestamp = int(time.time()) % 1000000
+            unique_id = str(uuid.uuid4())[:6].upper()
+            order_number = f"ORDER-{timestamp}-{unique_id}"
 
             # Создание заказа
             await db.execute("""
@@ -646,7 +641,7 @@ async def create_order(user_id: int, cart_items: List[Dict],
             result = await cursor.fetchone()
             order_id = result[0]
 
-            logging.info(f"✅ Заказ создан с ID={order_id}, номер={order_number}")
+            logging.info(f"✅ Заказ {order_number} создан с ID={order_id}")
 
             # Добавление позиций заказа
             for item in cart_items:
@@ -813,3 +808,61 @@ async def get_bonus_usage(user_id: int) -> bool:
         """, (user_id,))
         result = await cursor.fetchone()
         return result[0] == 1 if result else True  # По умолчанию True
+
+
+async def get_maintenance_mode() -> bool:
+    """Получение статуса режима техработ"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Проверяем, существует ли таблица settings
+            await db.execute("""
+                             CREATE TABLE IF NOT EXISTS settings
+                             (
+                                 key
+                                 TEXT
+                                 PRIMARY
+                                 KEY,
+                                 value
+                                 TEXT
+                             )
+                             """)
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT value FROM settings WHERE key = 'maintenance_mode'"
+            )
+            result = await cursor.fetchone()
+            return result[0] == '1' if result else False
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения статуса техработ: {e}")
+        return False
+
+
+async def set_maintenance_mode(enabled: bool) -> bool:
+    """Установка режима техработ"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Создаем таблицу если не существует
+            await db.execute("""
+                             CREATE TABLE IF NOT EXISTS settings
+                             (
+                                 key
+                                 TEXT
+                                 PRIMARY
+                                 KEY,
+                                 value
+                                 TEXT
+                             )
+                             """)
+
+            await db.execute("""
+                INSERT OR REPLACE INTO settings (key, value) 
+                VALUES ('maintenance_mode', ?)
+            """, ('1' if enabled else '0'))
+            await db.commit()
+
+            logging.info(f"🔧 Режим техработ: {'включен' if enabled else 'выключен'}")
+            return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка установки режима техработ: {e}")
+        return False
